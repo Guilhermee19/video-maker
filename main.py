@@ -7,6 +7,7 @@ import subprocess
 # Função para converter o vídeo para MP4 usando moviepy
 def converter_para_mp4(video_path, output_path):
     print("\n\t\t-----| 3. converter_para_mp4 |-----")
+    
     video = mp.VideoFileClip(video_path)
     video.write_videofile(output_path, codec="libx264", audio_codec="aac")
 
@@ -16,7 +17,6 @@ drawing = False
 
 # Função para desenhar o retângulo com o mouse
 def draw_rectangle(event, x, y, flags, param):
-    print("\n\t\t-----| 5. draw_rectangle |-----")
     global x1, y1, x2, y2, drawing
     
     if event == cv2.EVENT_LBUTTONDOWN:  # Quando o botão do mouse é pressionado
@@ -75,32 +75,87 @@ def detectar_webcam(video_path):
     cap.release()
     raise ValueError("Webcam não detectada no vídeo.")
 
+
 # Função para cortar o vídeo e obter a webcam
 def cortar_webcam(video_path, output_path, x, y, w, h):
-    print("\n\t\t-----| 6. cortar_webcam |-----")
+    print("\n\t\t-----| 5. cortar_webcam |-----")
     
-    # Certifique-se de que o comando ffmpeg está correto para cortar a área da webcam
-    command = [
-        "ffmpeg", "-i", video_path, "-vf",
-        f"crop={w}:{h}:{x}:{y}", "-c:a", "copy", output_path
-    ]
+    # Verificar se o caminho do vídeo de entrada existe
+    print(f"[DEBUG] Verificando se o arquivo de vídeo existe: {video_path}")
+    if not os.path.exists(video_path):
+        print(f"[ERRO] O arquivo de vídeo {video_path} não foi encontrado.")
+        return
+    else:
+        print(f"[DEBUG] O arquivo de vídeo foi encontrado.")
+
+    # Validar se as coordenadas e dimensões são válidas
+    print(f"[DEBUG] Validando as coordenadas e dimensões: x={x}, y={y}, w={w}, h={h}")
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        print("[ERRO] As coordenadas ou dimensões são inválidas.")
+        return
     
-    subprocess.run(command, check=True)
-    print(f"Vídeo recortado para a webcam: {output_path}")
+    # Garantir que o diretório de saída exista
+    output_dir = os.path.dirname(output_path)
+    print(f"[DEBUG] Verificando se o diretório de saída existe: {output_dir}")
+    if not os.path.exists(output_dir):
+        print(f"[AVISO] O diretório {output_dir} não existe. Criando...")
+        os.makedirs(output_dir)
+
+    try:
+        # Carregar o vídeo com o moviepy
+        print(f"[DEBUG] Carregando o vídeo: {video_path}")
+        video_clip = mp.VideoFileClip(video_path)
+        
+        # Verificar se o vídeo foi carregado corretamente
+        if video_clip is None:
+            print("[ERRO] Não foi possível carregar o vídeo.")
+            return
+        else:
+            print(f"[DEBUG] Vídeo carregado com sucesso. Tamanho: {video_clip.size}, FPS: {video_clip.fps}")
+        
+        # Cortar a área do vídeo
+        print(f"[DEBUG] Realizando o corte no vídeo: x={x}, y={y}, w={w}, h={h}")
+        # cropped_clip = video_clip.crop(x1=x, y1=y, width=w, height=h)
+        clip = video_clip.cropped(x1=x, y1=y, x2=w, y2=h) # Crop the video
+        
+        # Escrever o vídeo cortado no arquivo de saída
+        print(f"[DEBUG] Gravando o vídeo cortado em: {output_path}")
+        clip.write_videofile(output_path, codec="libx264")
+
+        print(f"Vídeo recortado e salvo em: {output_path}")
+
+    except Exception as e:
+        print(f"[ERRO] Ocorreu um erro ao cortar o vídeo: {e}")
+
+
 
 # Função para redimensionar o vídeo
 def redimensionar_video(video_path, output_path):
-    print("\n\t\t-----| redimensionar_video |-----")
+    print("\n\t\t-----| 6. redimensionar_video |-----")
+
+    # Verifique se o arquivo de vídeo existe
+    if not os.path.exists(video_path):
+        print(f"[ERRO] O arquivo de vídeo não foi encontrado: {video_path}")
+        return
     
-    command = [
-        "ffmpeg", "-i", video_path, "-vf",
-        "scale=1080:1920", "-c:a", "copy", output_path
-    ]
-    subprocess.run(command, check=True)
+    try:
+        # Carregar o vídeo com moviepy
+        video = mp.VideoFileClip(video_path)
+        
+        # Redimensionar o vídeo
+        video_resized = video.resize(newsize=(1080, 1920))  # A nova dimensão (largura, altura)
+        
+        # Salvar o vídeo redimensionado
+        video_resized.write_videofile(output_path, codec='libx264', audio_codec='aac')
+
+        print(f"[INFO] Vídeo redimensionado com sucesso: {output_path}")
+
+    except Exception as e:
+        print(f"[ERRO] Ocorreu um erro ao redimensionar o vídeo: {e}")
 
 # Função para combinar o vídeo da webcam com o vídeo principal
 def combinar_videos(webcam_path, video_path, output_path):
-    print("\n\t\t-----| combinar_videos |-----")
+    print("\n\t\t-----| 7. combinar_videos |-----")
     
     video = mp.VideoFileClip(video_path)
     webcam = mp.VideoFileClip(webcam_path).resize(width=1080)
@@ -125,9 +180,7 @@ def processar_video(video_path):
     
     # Detectar a webcam
     x, y, w, h = detectar_webcam(video_convertido)
-    print("\n")
     print(f"Webcam detectada na posição: x={x}, y={y}, largura={w}, altura={h}")
-    print("\n")
     
     # Criar o vídeo da webcam com o recorte
     webcam_crop = os.path.join("temp", "webcam.mp4")
@@ -139,11 +192,9 @@ def processar_video(video_path):
     
     # Combinar os vídeos
     combinar_videos(webcam_crop, video_resized, output_final)
-    print("\n")
     print(f"Vídeo finalizado com sucesso: {output_final}")
-    print("\n")
 
-
+# Função para processar vídeos na pasta
 def processar_videos_na_pasta(pasta):
     print("\n\t\t-----| 1. processar_videos_na_pasta |-----")
     
@@ -152,11 +203,21 @@ def processar_videos_na_pasta(pasta):
         
         # Verificar se o arquivo é um vídeo suportado (por exemplo, MKV ou MP4)
         if nome_arquivo.endswith(('.mkv', '.mp4')):
-            print("\n")
             print(f"Processando vídeo: {caminho_completo}")
-            print("\n")
             processar_video(caminho_completo)
 
 # Exemplo de uso:
 pasta_videos = "videos"
 processar_videos_na_pasta(pasta_videos)
+
+
+# Exemplo de chamada para testar o recorte
+# video_path = "videos/alan bug games.mkv"  # Substitua pelo caminho real do seu vídeo
+# output_path = "videos/webcam_recortado.mp4"  # Substitua pelo caminho de saída desejado
+
+# # Defina as coordenadas do retângulo a ser cortado (x, y, largura, altura)
+# x, y, w, h = detectar_webcam(video_path)
+# print(f"Webcam detectada na posição: x={x}, y={y}, largura={w}, altura={h}")
+
+# # Chamar a função para cortar o vídeo
+# cortar_webcam(video_path, output_path, x, y, w, h)
