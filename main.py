@@ -1,223 +1,383 @@
 import cv2
+import whisper
 import numpy as np
-import moviepy as mp
+import matplotlib.pyplot as plt
+from moviepy.editor import VideoFileClip, concatenate_videoclips
+from textblob import TextBlob
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import os
-import subprocess
+import json
+from datetime import datetime, timedelta
+import librosa
+import torch
+from transformers import pipeline
+import warnings
+warnings.filterwarnings("ignore")
 
-# Função para converter o vídeo para MP4 usando moviepy
-def converter_para_mp4(video_path, output_path):
-    print("\n\t\t-----| 3. converter_para_mp4 |-----")
-    
-    video = mp.VideoFileClip(video_path)
-    video.write_videofile(output_path, codec="libx264", audio_codec="aac")
-
-# Variáveis globais para armazenar as coordenadas do retângulo
-x1, y1, x2, y2 = -1, -1, -1, -1
-drawing = False
-
-# Função para desenhar o retângulo com o mouse
-def draw_rectangle(event, x, y, flags, param):
-    global x1, y1, x2, y2, drawing
-    
-    if event == cv2.EVENT_LBUTTONDOWN:  # Quando o botão do mouse é pressionado
-        drawing = True
-        x1, y1 = x, y  # Começar a posição do retângulo
-    
-    elif event == cv2.EVENT_MOUSEMOVE:  # Quando o mouse se move
-        if drawing:  # Se o botão do mouse está pressionado
-            x2, y2 = x, y  # Atualizar a posição do retângulo
-    
-    elif event == cv2.EVENT_LBUTTONUP:  # Quando o botão do mouse é solto
-        drawing = False
-        x2, y2 = x, y  # Definir a posição final do retângulo
-
-# Função para detectar a webcam
-def detectar_webcam(video_path):
-    print("\n\t\t-----| 4. detectar_webcam |-----")
-    
-    cap = cv2.VideoCapture(video_path)
-    
-    ret, frame = cap.read()
-    if not ret:
-        raise ValueError(f"Não foi possível ler o vídeo {video_path}.")
-    
-    # Mostrar o primeiro frame
-    cv2.imshow("Primeiro Frame", frame)
-    
-    # Definir a função de callback para desenhar o retângulo
-    cv2.setMouseCallback("Primeiro Frame", draw_rectangle)
-    
-    # Esperar até que o usuário desenhe o retângulo e aperte uma tecla
-    while True:
-        img_copy = frame.copy()
+class VideoAnalyzer:
+    def __init__(self, video_path, output_dir="highlights"):
+        self.video_path = video_path
+        self.output_dir = output_dir
+        self.video_name = os.path.splitext(os.path.basename(video_path))[0]
         
-        # Desenhar o retângulo na imagem
-        if x1 != -1 and y1 != -1 and x2 != -1 and y2 != -1:
-            cv2.rectangle(img_copy, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        # Criar diretório de saída
+        os.makedirs(output_dir, exist_ok=True)
         
-        # Exibir a imagem com o retângulo desenhado
-        cv2.imshow("Primeiro Frame", img_copy)
+        # Inicializar modelos de IA local
+        print("🤖 Carregando modelos de IA local...")
+        self.whisper_model = whisper.load_model("base")  # Modelo pequeno e rápido
+        self.sentiment_analyzer = SentimentIntensityAnalyzer()
         
-        # Esperar por uma tecla para sair
-        if cv2.waitKey(1) & 0xFF == ord('q'):  # Pressionar 'q' para finalizar
-            break
-    
-    # Fechar a janela
-    cv2.destroyAllWindows()
-    
-    # Verificar se o retângulo foi desenhado
-    if x1 != -1 and y1 != -1 and x2 != -1 and y2 != -1:
-        # Definir as coordenadas do retângulo
-        x, y, w, h = min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1)
+        # Detector de emoções (local) 
+        try:
+            self.emotion_classifier = pipeline(
+                "text-classification", 
+                model="j-hartmann/emotion-english-distilroberta-base",
+                device=0 if torch.cuda.is_available() else -1
+            )
+        except:
+            print("⚠️ Modelo de emoções não disponível, usando análise básica")
+            self.emotion_classifier = None
+            
+        # Dados de análise
+        self.segments = []
+        self.highlights = []
+        
+        print("✅ Modelos carregados com sucesso!")
+
+    def extract_audio_segments(self, segment_duration=30):
+        """Extrai segmentos de áudio do vídeo para análise"""
+        print("🎵 Extraindo e analisando áudio...")
+        
+        video = VideoFileClip(self.video_path)
+        duration = video.duration
+        
+        segments = []
+        for start_time in range(0, int(duration), segment_duration):
+            end_time = min(start_time + segment_duration, duration)
+            
+            # Extrair segmento de áudio
+            audio_segment = video.subclip(start_time, end_time).audio
+            
+            # Salvar temporariamente
+            temp_audio = f"temp_audio_{start_time}.wav"
+            audio_segment.write_audiofile(temp_audio, verbose=False, logger=None)
+            
+            segments.append({
+                'start': start_time,
+                'end': end_time,
+                'audio_file': temp_audio,
+                'duration': end_time - start_time
+            })
+            
+        video.close()
+        return segments
+
+    def transcribe_segments(self, audio_segments):
+        """Transcreve áudio usando Whisper local"""
+        print("🗣️ Transcrevendo áudio...")
+        
+        for i, segment in enumerate(audio_segments):
+            print(f"📝 Transcrevendo segmento {i+1}/{len(audio_segments)}")
+            
+            try:
+                # Transcrever com Whisper
+                result = self.whisper_model.transcribe(segment['audio_file'])
+                segment['transcription'] = result['text']
+                segment['language'] = result.get('language', 'pt')
+                
+                # Limpar arquivo temporário
+                os.remove(segment['audio_file'])
+                
+            except Exception as e:
+                print(f"⚠️ Erro na transcrição do segmento {i+1}: {e}")
+                segment['transcription'] = ""
+                segment['language'] = "pt"
+        
+        return audio_segments
+
+    def analyze_sentiment_and_emotions(self, segments):
+        """Analisa sentimentos e emoções do texto transcrito"""
+        print("😄 Analisando sentimentos e emoções...")
+        
+        for segment in segments:
+            text = segment['transcription']
+            if not text.strip():
+                segment['sentiment_score'] = 0
+                segment['emotion'] = 'neutral'
+                segment['funny_score'] = 0
+                continue
+            
+            # Análise de sentimento com VADER
+            vader_scores = self.sentiment_analyzer.polarity_scores(text)
+            
+            # Análise com TextBlob
+            blob = TextBlob(text)
+            
+            # Análise de emoções se disponível
+            emotion = 'neutral'
+            if self.emotion_classifier:
+                try:
+                    emotion_result = self.emotion_classifier(text)
+                    emotion = emotion_result[0]['label'].lower()
+                except:
+                    emotion = 'neutral'
+            
+            # Calcular score de "diversão"
+            funny_keywords = ['haha', 'rsrs', 'kkk', 'lol', 'engraçado', 'hilário', 
+                            'gargalhada', 'risada', 'piada', 'cômico', 'risos']
+            
+            funny_score = 0
+            text_lower = text.lower()
+            for keyword in funny_keywords:
+                funny_score += text_lower.count(keyword)
+            
+            # Score baseado em emoções positivas e intensidade
+            sentiment_score = vader_scores['compound'] + blob.sentiment.polarity
+            if emotion in ['joy', 'surprise', 'amusement']:
+                sentiment_score += 0.3
+            
+            segment.update({
+                'sentiment_score': sentiment_score,
+                'emotion': emotion,
+                'funny_score': funny_score,
+                'vader_scores': vader_scores,
+                'polarity': blob.sentiment.polarity,
+                'subjectivity': blob.sentiment.subjectivity
+            })
+        
+        return segments
+
+    def analyze_visual_features(self, segments):
+        """Analisa características visuais como movimento e faces"""
+        print("👀 Analisando características visuais...")
+        
+        cap = cv2.VideoCapture(self.video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        
+        # Carregador de detector de faces
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        
+        for segment in segments:
+            start_frame = int(segment['start'] * fps)
+            end_frame = int(segment['end'] * fps)
+            
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            
+            face_count = 0
+            motion_score = 0
+            frame_count = 0
+            prev_frame = None
+            
+            while cap.get(cv2.CAP_PROP_POS_FRAMES) < end_frame:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                frame_count += 1
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                
+                # Detectar faces
+                faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+                face_count += len(faces)
+                
+                # Calcular movimento entre frames
+                if prev_frame is not None:
+                    diff = cv2.absdiff(prev_frame, gray)
+                    motion_score += np.mean(diff)
+                
+                prev_frame = gray
+            
+            segment.update({
+                'face_density': face_count / max(frame_count, 1),
+                'motion_score': motion_score / max(frame_count, 1),
+                'visual_activity': (face_count + motion_score) / max(frame_count, 1)
+            })
+        
         cap.release()
-        return (x, y, w, h)
-    
-    cap.release()
-    raise ValueError("Webcam não detectada no vídeo.")
+        return segments
 
+    def calculate_highlight_scores(self, segments):
+        """Calcula scores finais para identificar highlights"""
+        print("⭐ Calculando scores de highlights...")
+        
+        for segment in segments:
+            # Componentes do score
+            sentiment_component = max(0, segment['sentiment_score']) * 0.3
+            funny_component = min(segment['funny_score'], 5) * 0.2  # Cap em 5
+            emotion_component = 0.2 if segment['emotion'] in ['joy', 'surprise', 'amusement'] else 0
+            visual_component = min(segment['visual_activity'], 100) / 100 * 0.3  # Normalizar
+            
+            # Score final
+            highlight_score = (sentiment_component + funny_component + 
+                             emotion_component + visual_component)
+            
+            segment['highlight_score'] = highlight_score
+            
+            # Classificar como highlight se score > threshold
+            segment['is_highlight'] = highlight_score > 0.4
+        
+        return segments
 
-# Função para cortar o vídeo e obter a webcam
-def cortar_webcam(video_path, output_path, x, y, w, h):
-    print("\n\t\t-----| 5. cortar_webcam |-----")
-    
-    # Verificar se o caminho do vídeo de entrada existe
-    print(f"[DEBUG] Verificando se o arquivo de vídeo existe: {video_path}")
-    if not os.path.exists(video_path):
-        print(f"[ERRO] O arquivo de vídeo {video_path} não foi encontrado.")
+    def extract_highlights(self, segments, min_duration=5, max_highlights=10):
+        """Extrai os melhores momentos baseado nos scores"""
+        print("✂️ Extraindo highlights...")
+        
+        # Filtrar e ordenar highlights
+        highlights = [s for s in segments if s['is_highlight']]
+        highlights.sort(key=lambda x: x['highlight_score'], reverse=True)
+        
+        # Limitar número de highlights
+        highlights = highlights[:max_highlights]
+        
+        # Expandir duração se muito curto
+        video = VideoFileClip(self.video_path)
+        clips = []
+        
+        for i, highlight in enumerate(highlights):
+            start = max(0, highlight['start'] - 2)  # 2s antes
+            end = min(video.duration, highlight['end'] + 2)  # 2s depois
+            
+            if end - start < min_duration:
+                # Expandir para duração mínima
+                center = (start + end) / 2
+                start = max(0, center - min_duration/2)
+                end = min(video.duration, center + min_duration/2)
+            
+            clip = video.subclip(start, end)
+            clips.append(clip)
+            
+            print(f"🎬 Highlight {i+1}: {start:.1f}s - {end:.1f}s "
+                  f"(Score: {highlight['highlight_score']:.3f})")
+        
+        video.close()
+        return clips, highlights
+
+    def create_highlight_video(self, clips):
+        """Cria vídeo compilado com os highlights"""
+        if not clips:
+            print("❌ Nenhum highlight encontrado")
+            return None
+            
+        print("🎬 Criando vídeo de highlights...")
+        
+        # Concatenar clips
+        final_video = concatenate_videoclips(clips, method="compose")
+        
+        # Salvar
+        output_path = os.path.join(self.output_dir, f"{self.video_name}_highlights.mp4")
+        final_video.write_videofile(
+            output_path, 
+            codec='libx264',
+            audio_codec='aac',
+            verbose=False,
+            logger=None
+        )
+        
+        final_video.close()
+        print(f"✅ Highlights salvos: {output_path}")
+        return output_path
+
+    def save_analysis_report(self, segments):
+        """Salva relatório detalhado da análise"""
+        report = {
+            'video_file': self.video_path,
+            'analysis_date': datetime.now().isoformat(),
+            'total_segments': len(segments),
+            'highlights_found': len([s for s in segments if s['is_highlight']]),
+            'segments': segments
+        }
+        
+        report_path = os.path.join(self.output_dir, f"{self.video_name}_analysis.json")
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        
+        print(f"📊 Relatório salvo: {report_path}")
+
+    def analyze_video(self, segment_duration=30):
+        """Executa análise completa do vídeo"""
+        print(f"🚀 Iniciando análise de: {self.video_path}")
+        
+        try:
+            # 1. Extrair segmentos de áudio
+            audio_segments = self.extract_audio_segments(segment_duration)
+            
+            # 2. Transcrever áudio
+            segments = self.transcribe_segments(audio_segments)
+            
+            # 3. Analisar sentimentos e emoções
+            segments = self.analyze_sentiment_and_emotions(segments)
+            
+            # 4. Analisar características visuais  
+            segments = self.analyze_visual_features(segments)
+            
+            # 5. Calcular scores de highlights
+            segments = self.calculate_highlight_scores(segments)
+            
+            # 6. Extrair highlights
+            clips, highlights = self.extract_highlights(segments)
+            
+            # 7. Criar vídeo final
+            highlight_video = self.create_highlight_video(clips)
+            
+            # 8. Salvar relatório
+            self.save_analysis_report(segments)
+            
+            print("\n🎉 Análise concluída!")
+            print(f"📈 {len(highlights)} highlights encontrados")
+            print(f"🎬 Vídeo de highlights: {highlight_video}")
+            
+            return highlight_video, highlights, segments
+            
+        except Exception as e:
+            print(f"❌ Erro durante análise: {e}")
+            return None, [], []
+
+def main():
+    # Verificar se existe vídeo na pasta
+    videos_dir = "videos"
+    if not os.path.exists(videos_dir):
+        print("❌ Pasta 'videos' não encontrada")
         return
+    
+    # Listar vídeos disponíveis
+    video_files = [f for f in os.listdir(videos_dir) 
+                   if f.lower().endswith(('.mp4', '.avi', '.mkv', '.mov'))]
+    
+    if not video_files:
+        print("❌ Nenhum vídeo encontrado na pasta 'videos'")
+        return
+    
+    print("🎥 Vídeos encontrados:")
+    for i, video in enumerate(video_files, 1):
+        print(f"{i}. {video}")
+    
+    # Selecionar vídeo (ou usar o primeiro se só houver um)
+    if len(video_files) == 1:
+        selected_video = video_files[0]
+        print(f"📹 Analisando: {selected_video}")
     else:
-        print(f"[DEBUG] O arquivo de vídeo foi encontrado.")
-
-    # Validar se as coordenadas e dimensões são válidas
-    print(f"[DEBUG] Validando as coordenadas e dimensões: x={x}, y={y}, w={w}, h={h}")
-    if x < 0 or y < 0 or w <= 0 or h <= 0:
-        print("[ERRO] As coordenadas ou dimensões são inválidas.")
-        return
-    
-    # Garantir que o diretório de saída exista
-    output_dir = os.path.dirname(output_path)
-    print(f"[DEBUG] Verificando se o diretório de saída existe: {output_dir}")
-    if not os.path.exists(output_dir):
-        print(f"[AVISO] O diretório {output_dir} não existe. Criando...")
-        os.makedirs(output_dir)
-
-    try:
-        # Carregar o vídeo com o moviepy
-        print(f"[DEBUG] Carregando o vídeo: {video_path}")
-        video_clip = mp.VideoFileClip(video_path)
-        
-        # Verificar se o vídeo foi carregado corretamente
-        if video_clip is None:
-            print("[ERRO] Não foi possível carregar o vídeo.")
+        try:
+            choice = int(input("Escolha um vídeo (número): ")) - 1
+            selected_video = video_files[choice]
+        except (ValueError, IndexError):
+            print("❌ Escolha inválida")
             return
-        else:
-            print(f"[DEBUG] Vídeo carregado com sucesso. Tamanho: {video_clip.size}, FPS: {video_clip.fps}")
-        
-        # Cortar a área do vídeo
-        print(f"[DEBUG] Realizando o corte no vídeo: x={x}, y={y}, w={w}, h={h}")
-        # cropped_clip = video_clip.crop(x1=x, y1=y, width=w, height=h)
-        clip = video_clip.cropped(x1=x, y1=y, x2=w, y2=h) # Crop the video
-        
-        # Escrever o vídeo cortado no arquivo de saída
-        print(f"[DEBUG] Gravando o vídeo cortado em: {output_path}")
-        clip.write_videofile(output_path, codec="libx264")
-
-        print(f"Vídeo recortado e salvo em: {output_path}")
-
-    except Exception as e:
-        print(f"[ERRO] Ocorreu um erro ao cortar o vídeo: {e}")
-
-
-
-# Função para redimensionar o vídeo
-def redimensionar_video(video_path, output_path):
-    print("\n\t\t-----| 6. redimensionar_video |-----")
-
-    # Verifique se o arquivo de vídeo existe
-    if not os.path.exists(video_path):
-        print(f"[ERRO] O arquivo de vídeo não foi encontrado: {video_path}")
-        return
     
-    try:
-        # Carregar o vídeo com moviepy
-        video = mp.VideoFileClip(video_path)
-        
-        # Redimensionar o vídeo
-        video_resized = video.resize(newsize=(1080, 1920))  # A nova dimensão (largura, altura)
-        
-        # Salvar o vídeo redimensionado
-        video_resized.write_videofile(output_path, codec='libx264', audio_codec='aac')
-
-        print(f"[INFO] Vídeo redimensionado com sucesso: {output_path}")
-
-    except Exception as e:
-        print(f"[ERRO] Ocorreu um erro ao redimensionar o vídeo: {e}")
-
-# Função para combinar o vídeo da webcam com o vídeo principal
-def combinar_videos(webcam_path, video_path, output_path):
-    print("\n\t\t-----| 7. combinar_videos |-----")
+    # Executar análise
+    video_path = os.path.join(videos_dir, selected_video)
+    analyzer = VideoAnalyzer(video_path)
     
-    video = mp.VideoFileClip(video_path)
-    webcam = mp.VideoFileClip(webcam_path).resize(width=1080)
+    # Configurar duração dos segmentos
+    segment_duration = 30  # segundos
+    print(f"⚙️ Configuração: segmentos de {segment_duration}s")
     
-    webcam = webcam.set_position((0, 0))
-    video = video.set_position((0, 1080 - video.size[1]))
+    # Analisar vídeo
+    result = analyzer.analyze_video(segment_duration)
     
-    final = mp.CompositeVideoClip([video, webcam])
-    final.write_videofile(output_path, fps=30)
+    if result[0]:  # Se gerou highlights
+        print(f"\n🎯 Melhor momento encontrado!")
+        print("💡 Dica: Verifique o arquivo JSON para detalhes da análise")
 
-# Função principal para processar o vídeo
-def processar_video(video_path):
-    print("\n\t\t-----| 2. processar_video |-----")
-    
-    os.makedirs("temp", exist_ok=True)
-    nome_base = os.path.basename(video_path).rsplit(".", 1)[0]
-    output_final = os.path.join("temp", f"{nome_base} - Shorts.mp4")
-    
-    # Converter o vídeo para MP4, se necessário
-    video_convertido = os.path.join("temp", f"{nome_base}_convertido.mp4")
-    converter_para_mp4(video_path, video_convertido)
-    
-    # Detectar a webcam
-    x, y, w, h = detectar_webcam(video_convertido)
-    print(f"Webcam detectada na posição: x={x}, y={y}, largura={w}, altura={h}")
-    
-    # Criar o vídeo da webcam com o recorte
-    webcam_crop = os.path.join("temp", "webcam.mp4")
-    cortar_webcam(video_convertido, webcam_crop, x, y, w, h)
-    
-    # Redimensionar o vídeo principal
-    video_resized = os.path.join("temp", "video_resized.mp4")
-    redimensionar_video(video_convertido, video_resized)
-    
-    # Combinar os vídeos
-    combinar_videos(webcam_crop, video_resized, output_final)
-    print(f"Vídeo finalizado com sucesso: {output_final}")
-
-# Função para processar vídeos na pasta
-def processar_videos_na_pasta(pasta):
-    print("\n\t\t-----| 1. processar_videos_na_pasta |-----")
-    
-    for nome_arquivo in os.listdir(pasta):
-        caminho_completo = os.path.join(pasta, nome_arquivo)
-        
-        # Verificar se o arquivo é um vídeo suportado (por exemplo, MKV ou MP4)
-        if nome_arquivo.endswith(('.mkv', '.mp4')):
-            print(f"Processando vídeo: {caminho_completo}")
-            processar_video(caminho_completo)
-
-# Exemplo de uso:
-pasta_videos = "videos"
-processar_videos_na_pasta(pasta_videos)
-
-
-# Exemplo de chamada para testar o recorte
-# video_path = "videos/alan bug games.mkv"  # Substitua pelo caminho real do seu vídeo
-# output_path = "videos/webcam_recortado.mp4"  # Substitua pelo caminho de saída desejado
-
-# # Defina as coordenadas do retângulo a ser cortado (x, y, largura, altura)
-# x, y, w, h = detectar_webcam(video_path)
-# print(f"Webcam detectada na posição: x={x}, y={y}, largura={w}, altura={h}")
-
-# # Chamar a função para cortar o vídeo
-# cortar_webcam(video_path, output_path, x, y, w, h)
+if __name__ == "__main__":
+    main()

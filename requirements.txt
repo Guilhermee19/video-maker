@@ -1,0 +1,14 @@
+openai-whisper
+moviepy
+opencv-python
+numpy
+matplotlib
+nltk
+textblob
+vaderSentiment
+torch
+torchvision
+transformers
+librosa
+scikit-learn
+Pillow
