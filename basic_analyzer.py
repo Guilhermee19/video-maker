@@ -9,6 +9,31 @@ import json
 from datetime import datetime
 import librosa
 import matplotlib.pyplot as plt
+import signal
+import sys
+import threading
+import time
+import signal
+import sys
+import threading
+import time
+
+def convert_numpy_types(obj):
+    """Converte tipos numpy para tipos Python nativos para serialização JSON"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    else:
+        return obj
 
 class BasicVideoAnalyzer:
     def __init__(self, video_path, output_dir="basic_analysis"):
@@ -16,8 +41,76 @@ class BasicVideoAnalyzer:
         self.output_dir = output_dir
         self.video_name = os.path.splitext(os.path.basename(video_path))[0]
         
+        # Estado para pause/resume
+        self.interrupted = False
+        self.current_segments = []
+        self.save_interval = 10  # Salvar a cada 10 segmentos
+        self.temp_file = os.path.join(output_dir, f"{self.video_name}_temp_progress.json")
+        
         os.makedirs(output_dir, exist_ok=True)
+        self._setup_signal_handlers()
         print("🔥 Video Analyzer Básico - Sem dependências complexas!")
+        print("💡 Pressione Ctrl+C para pausar e salvar progresso")
+
+    def _setup_signal_handlers(self):
+        """Configura manipuladores de sinal para pause gracioso"""
+        def signal_handler(signum, frame):
+            print("\n⚠️  Interrupção detectada! Salvando progresso...")
+            self.interrupted = True
+            self._save_temp_progress()
+            
+        signal.signal(signal.SIGINT, signal_handler)
+        if hasattr(signal, 'SIGBREAK'):  # Windows
+            signal.signal(signal.SIGBREAK, signal_handler)
+    
+    def _save_temp_progress(self):
+        """Salva progresso temporário"""
+        if self.current_segments:
+            progress_data = {
+                'video_path': self.video_path,
+                'timestamp': datetime.now().isoformat(),
+                'segments_completed': len(self.current_segments),
+                'segments': convert_numpy_types(self.current_segments),
+                'last_frame_analyzed': getattr(self, 'last_frame_analyzed', 0)
+            }
+            
+            with open(self.temp_file, 'w', encoding='utf-8') as f:
+                json.dump(progress_data, f, indent=2, ensure_ascii=False)
+            
+            print(f"💾 Progresso salvo: {len(self.current_segments)} segmentos analisados")
+            print(f"📁 Arquivo temporário: {self.temp_file}")
+            print("🔄 Execute novamente para continuar de onde parou")
+    
+    def _load_temp_progress(self):
+        """Carrega progresso salvo anteriormente"""
+        if os.path.exists(self.temp_file):
+            try:
+                with open(self.temp_file, 'r', encoding='utf-8') as f:
+                    progress_data = json.load(f)
+                
+                if progress_data['video_path'] == self.video_path:
+                    self.current_segments = progress_data['segments']
+                    last_frame = progress_data.get('last_frame_analyzed', 0)
+                    
+                    print(f"🔄 Progresso anterior encontrado!")
+                    print(f"📊 {len(self.current_segments)} segmentos já analisados")
+                    print(f"⏭️  Continuando da posição {last_frame}...")
+                    
+                    return last_frame
+                    
+            except Exception as e:
+                print(f"⚠️  Erro ao carregar progresso: {e}")
+                
+        return 0
+    
+    def _cleanup_temp_files(self):
+        """Remove arquivos temporários após conclusão"""
+        if os.path.exists(self.temp_file):
+            try:
+                os.remove(self.temp_file)
+                print("🧹 Arquivos temporários removidos")
+            except Exception as e:
+                print(f"⚠️  Erro ao remover arquivos temporários: {e}")
 
     def extract_audio_from_video(self):
         """Extrai áudio do vídeo usando OpenCV"""
@@ -43,7 +136,7 @@ class BasicVideoAnalyzer:
             print("💡 Dica: Instale FFmpeg para análise completa de áudio")
             return None
 
-    def analyze_video_without_audio(self, segment_duration=15):
+    def analyze_video_without_audio(self, segment_duration=15, start_from_frame=0):
         """Analisa apenas características visuais (sem áudio)"""
         print("👀 Analisando características visuais...")
         
@@ -59,11 +152,23 @@ class BasicVideoAnalyzer:
         
         print(f"📹 Vídeo: {duration:.1f}s, {fps:.1f} FPS, {total_frames} frames")
         
-        segments = []
+        # Carregar progresso existente se houver
+        if start_from_frame == 0:
+            start_from_frame = self._load_temp_progress()
+        
+        segments = self.current_segments.copy()  # Manter segmentos já processados
         frames_per_segment = int(fps * segment_duration)
         
-        # Analisar em segmentos
-        for start_frame in range(0, total_frames, frames_per_segment):
+        # Analisar em segmentos a partir do frame inicial  
+        start_range = max(start_from_frame, len(segments) * frames_per_segment)
+        
+        print(f"▶️  Iniciando análise a partir do frame {start_range}")
+        
+        for start_frame in range(start_range, total_frames, frames_per_segment):
+            # Verificar se foi interrompido
+            if self.interrupted:
+                print("\n⏸️  Análise pausada pelo usuário")
+                break
             end_frame = min(start_frame + frames_per_segment, total_frames)
             
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -148,10 +253,17 @@ class BasicVideoAnalyzer:
             }
             
             segments.append(segment)
+            self.current_segments = segments  # Atualizar estado atual
+            self.last_frame_analyzed = end_frame  # Marcar último frame analisado
             
             print(f"📊 {start_time:.1f}-{end_time:.1f}s: "
                   f"atividade={activity_score:.3f} "
                   f"{'✨' if activity_score > 0.3 else ''}")
+            
+            # Salvar progresso periodicamente
+            if len(segments) % self.save_interval == 0:
+                self._save_temp_progress()
+                print(f"💾 Progresso automático salvo ({len(segments)} segmentos)")
         
         cap.release()
         return segments
@@ -290,19 +402,36 @@ class BasicVideoAnalyzer:
                 'highlights': highlights
             }
             
+            # Converter tipos numpy para tipos Python antes da serialização
+            report = convert_numpy_types(report)
+            
             report_path = os.path.join(self.output_dir, f"{self.video_name}_basic_report.json")
             with open(report_path, 'w', encoding='utf-8') as f:
                 json.dump(report, f, indent=2, ensure_ascii=False)
             
-            print(f"\n🎉 Análise básica concluída!")
+            # Análise completada com sucesso - remover arquivos temporários
+            if not self.interrupted:
+                self._cleanup_temp_files()
+                print(f"\n🎉 Análise básica concluída!")
+            else:
+                print(f"\n⏸️  Análise pausada - progresso salvo para retomar depois")
+            
             print(f"📊 Gráfico: {chart}")
             print(f"📋 Highlights: {highlight_file}")
             print(f"📄 Relatório: {report_path}")
             
             return highlight_file, highlights
             
+        except KeyboardInterrupt:
+            print(f"\n⏸️  Análise interrompida pelo usuário")
+            if self.current_segments:
+                self._save_temp_progress()
+            return None, []
         except Exception as e:
             print(f"❌ Erro durante análise: {e}")
+            if self.current_segments:
+                print("💾 Salvando progresso mesmo com erro...")
+                self._save_temp_progress()
             return None, []
 
 def main():
@@ -327,6 +456,14 @@ def main():
     video_path = os.path.join(videos_dir, selected_video)
     analyzer = BasicVideoAnalyzer(video_path)
     
+    # Verificar se há progresso anterior
+    if os.path.exists(analyzer.temp_file):
+        print("\n🔄 Progresso anterior detectado!")
+        response = input("Deseja continuar de onde parou? (s/n): ").lower()
+        if response.startswith('n'):
+            analyzer._cleanup_temp_files()
+            print("🧹 Progresso anterior removido. Iniciando do zero...")
+    
     # Executar análise
     result = analyzer.run_basic_analysis(segment_duration=20)
     
@@ -335,6 +472,9 @@ def main():
         print("   - FFmpeg (linha de comando)")
         print("   - Qualquer editor de vídeo")
         print("   - Sites como Kapwing ou Clideo")
+    else:
+        print("\n🔄 Dica: Execute novamente para continuar a análise pausada")
+        print("💡 Para resetar tudo, delete o arquivo temporário na pasta basic_analysis")
 
 if __name__ == "__main__":
     main()
